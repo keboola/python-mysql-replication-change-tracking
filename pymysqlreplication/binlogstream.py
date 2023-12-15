@@ -1,21 +1,25 @@
 # -*- coding: utf-8 -*-
-
-import pymysql
+import functools
+import logging
 import struct
 from distutils.version import LooseVersion
+from typing import List, Callable
 
+import backoff
+import pymysql
 from pymysql.constants.COMMAND import COM_BINLOG_DUMP, COM_REGISTER_SLAVE
 from pymysql.cursors import DictCursor
 
-from .packet import BinLogPacketWrapper
-from .constants.BINLOG import TABLE_MAP_EVENT, ROTATE_EVENT, FORMAT_DESCRIPTION_EVENT
-from .gtid import GtidSet
+from .constants.BINLOG import TABLE_MAP_EVENT, ROTATE_EVENT, QUERY_EVENT
+from .ddl_parser import TableSchemaChange, TableChangeType, AlterStatementParser
 from .event import (
     QueryEvent, RotateEvent, FormatDescriptionEvent,
     XidEvent, GtidEvent, StopEvent, XAPrepareEvent,
     BeginLoadQueryEvent, ExecuteLoadQueryEvent,
-    HeartbeatLogEvent, NotImplementedEvent, MariadbGtidEvent)
-from .exceptions import BinLogNotEnabled
+    HeartbeatLogEvent, NotImplementedEvent, MariadbGtidEvent, QueryEventWithSchemaChanges)
+from .exceptions import BinLogNotEnabled, SchemaOffsyncError
+from .gtid import GtidSet
+from .packet import BinLogPacketWrapper
 from .row_event import (
     UpdateRowsEvent, WriteRowsEvent, DeleteRowsEvent, TableMapEvent)
 
@@ -31,8 +35,302 @@ except ImportError:
 MYSQL_EXPECTED_ERROR_CODES = [2013, 2006]
 
 
-class ReportSlave(object):
+class TableColumnSchemaCache:
+    """
+    Container object for table Schema cache. Caches table column schema based on table name.
 
+    The column schema object is a dictionary:
+
+    ```
+                   stream-id: {
+                        'COLUMN_NAME': 'name',
+                        'ORDINAL_POSITION': 1,
+                        'COLLATION_NAME': None,
+                        'CHARACTER_SET_NAME': None,
+                        'COLUMN_COMMENT': None,
+                        'COLUMN_TYPE': 'BLOB',
+                        'COLUMN_KEY': ''
+                    }
+    ```
+
+    """
+
+    def __init__(self, table_schema_cache: dict, table_schema_current: dict = None,
+                 cache_index_callable: Callable = lambda a, b: a + '-' + b):
+        """
+
+        Args:
+            table_schema_cache: Column schemas cached from the last time. It needs to be updated with each ALTER event.
+            table_schema_current:
+                internal cache of column schema that is actual at the time of execution
+                (possibly newer than table_schema_cache)
+        """
+        self.table_schema_cache = table_schema_cache or {}
+        self.__table_indexes = {}
+
+        # internal cache of column schema that is actual at the time of execution
+        #         (possibly newer than table_schema_cache)
+        self._table_schema_current = table_schema_current or {}
+        self._cache_index_generator = cache_index_callable
+
+    def _get_db_default_schema(self):
+        table_schema = {}
+        if self._table_schema_current:
+            key = next(iter(self._table_schema_current))
+            current_schema = self._table_schema_current[key]
+            if current_schema:
+                table_schema = current_schema[0]
+
+        if not table_schema.get('DEFAULT_CHARSET'):
+            logging.warning('No default charset found, using utf8',
+                            extra={"full_message": self._table_schema_current})
+        return table_schema.get('DEFAULT_CHARSET', 'utf8')
+
+    @staticmethod
+    def build_column_schema(column_name: str, ordinal_position: int, column_type: str, is_primary_key: bool,
+                            collation=None,
+                            character_set_name=None, column_comment=None) -> dict:
+        if is_primary_key:
+            key = 'PRI'
+        else:
+            key = ''
+        return {
+            'COLUMN_NAME': column_name,
+            'ORDINAL_POSITION': ordinal_position,
+            'COLLATION_NAME': collation,
+            'CHARACTER_SET_NAME': character_set_name,
+            'COLUMN_COMMENT': column_comment,
+            'COLUMN_TYPE': column_type,
+            'COLUMN_KEY': key
+        }
+
+    def is_current_schema_cached(self, schema: str, table: str):
+        if self._table_schema_current.get(self.get_table_cache_index(schema, table)):
+            return True
+        else:
+            return False
+
+    def update_current_schema_cache(self, schema: str, table: str, column_schema: []):
+        """
+        Update internal cache of column schema that is actual at the time of execution
+        (possibly newer than table_schema_cache)
+        Args:
+            column_schema:
+
+        Returns:
+
+        """
+        index = self.get_table_cache_index(schema, table)
+        self._table_schema_current[index] = column_schema
+
+    def get_column_schema(self, schema: str, table: str) -> List[dict]:
+        index = self.get_table_cache_index(schema, table)
+        return self.table_schema_cache.get(index)
+
+    def update_table_ids_cache(self, schema: str, table: str, mysql_table_id: int):
+        """
+        Keeps MySQL internal table_ids cached
+
+        Args:
+            schema:
+            table:
+            mysql_table_id: Internal Mysql table id
+
+        Returns:
+
+        """
+        index = self.get_table_cache_index(schema, table)
+        if not self.__table_indexes.get(index):
+            self.__table_indexes[index] = set()
+
+        self.__table_indexes[index].add(mysql_table_id)
+
+    def invalidate_table_ids_cache(self):
+        self.__table_indexes = {}
+
+    def get_table_ids(self, schema: str, table: str):
+        """
+        Returns internal table ID from cache.
+        Args:
+            schema:
+            table:
+
+        Returns:
+
+        """
+        index = self.get_table_cache_index(schema, table)
+        return self.__table_indexes.get(index, [])
+
+    def set_column_schema(self, schema: str, table: str, column_schema: List[dict]):
+        index = self.get_table_cache_index(schema, table)
+        self.table_schema_cache[index] = column_schema
+
+    def get_table_cache_index(self, schema: str, table: str):
+        # index as not case sensitive
+        return self._cache_index_generator(schema, table)
+
+    def update_cache(self, table_change: TableSchemaChange):
+        """
+        Updates schema cache based on table changes.
+
+        Args:
+            table_changes:
+
+        Returns:
+
+        """
+
+        if table_change.type == TableChangeType.DROP_COLUMN:
+            self.update_cache_drop_column(table_change)
+        elif table_change.type == TableChangeType.ADD_COLUMN:
+            self.update_cache_add_column(table_change)
+
+    def update_cache_drop_column(self, drop_change: TableSchemaChange):
+        index = self.get_table_cache_index(drop_change.schema, drop_change.table_name)
+        column_schema = self.table_schema_cache.get(index, [])
+
+        # drop column if exists
+        drop_at_position = None
+        update_ordinal_position = False
+        new_schema = []
+        # 1 based
+        for idx, col in enumerate(column_schema, start=1):
+            if col['COLUMN_NAME'].upper() == drop_change.column_name.upper():
+                # mark and skip
+                update_ordinal_position = True
+                continue
+
+            if update_ordinal_position:
+                # shift ordinal position
+                col['ORDINAL_POSITION'] = idx - 1
+            new_schema.append(col)
+
+        if not update_ordinal_position:
+            raise SchemaOffsyncError(f'Dropped column: "{drop_change.column_name}" '
+                                     f'is already missing in the provided starting '
+                                     f'schema of table {drop_change.table_name} => may lead to value shift!'
+                                     f' The affected query is: {drop_change.query}')
+
+        if not column_schema:
+            # should not happen
+            raise SchemaOffsyncError(f'Table {index} not found in the provided table schema cache!')
+
+        self.table_schema_cache[index] = new_schema
+
+    def __add_column_at_position(self, original_schema, added_column, after_col, table_name):
+        new_schema = []
+        # add column if not exists
+        update_ordinal_position = False
+        # 1 based
+        for idx, col in enumerate(original_schema, start=1):
+
+            # on first position
+            if idx == 1 and after_col == '':
+                added_column['ORDINAL_POSITION'] = 1
+                update_ordinal_position = True
+                new_schema.append(col)
+
+            # after specific
+            elif after_col and col['COLUMN_NAME'].upper() == after_col.upper():
+                added_column['ORDINAL_POSITION'] = idx + 1
+                # mark and add both
+                new_schema.append(col)
+                new_schema.append(added_column)
+                update_ordinal_position = True
+
+            elif update_ordinal_position:
+                # shift ordinal position of others
+                col['ORDINAL_POSITION'] = idx + 1
+                new_schema.append(col)
+            else:
+                # otherwise append unchanged
+                new_schema.append(col)
+
+        if not update_ordinal_position:
+            raise SchemaOffsyncError(f'Dropped column: "{added_column["COLUMN_NAME"]}" in table {table_name}'
+                                     f'is already missing in the provided starting schema => may lead to value shift!')
+        return new_schema
+
+    def update_cache_add_column(self, add_change: TableSchemaChange):
+        index = self.get_table_cache_index(add_change.schema, add_change.table_name)
+        column_schema = self.table_schema_cache.get(index, [])
+
+        logging.debug(f'Current column schema cache: {self.table_schema_cache}, index: {index}')
+        column_names = [c['COLUMN_NAME'].upper() for c in column_schema]
+        if not column_names:
+            raise RuntimeError(f'The schema cache for table {index} is not initialized!')
+
+        if add_change.column_name.upper() in column_names:
+            logging.warning(f'The added column "{add_change.column_name.upper()}" is already present '
+                            f'in the schema "{index}", skipping.')
+            return
+        logging.debug(f"New schema ADD change received {add_change}")
+        added_column = self._build_new_column_schema(add_change)
+        logging.debug(f"New column schema built {added_column}")
+        new_schema = []
+        # get after_column
+        if add_change.first_position:
+            after_col = ''
+        elif add_change.after_column:
+            after_col = add_change.after_column
+        else:
+            # add after last
+            added_column['ORDINAL_POSITION'] = len(column_schema) + 1
+            column_schema.append(added_column)
+            new_schema = column_schema
+
+        # exit
+        if not new_schema:
+            new_schema = self.__add_column_at_position(column_schema, added_column, after_col, add_change.table_name)
+
+        if not column_schema:
+            # should not happen
+            raise SchemaOffsyncError(f'Table {index} not found in the provided table schema cache!')
+
+        self.table_schema_cache[index] = new_schema
+
+    def _build_new_column_schema(self, table_change: TableSchemaChange) -> dict:
+        index = self.get_table_cache_index(table_change.schema, table_change.table_name)
+
+        current_schema = self._table_schema_current.get(index, [])
+        if not current_schema:
+            logging.warning(f'Table {table_change.table_name} not found in current schema cache.',
+                            extra={'full_message': self._table_schema_current})
+        existing_col = None
+
+        # check if column exists in current schema
+        # this allows to get all column metadata properly in case
+        # we missed some ALTER COLUMN statement, e.g. for changing datatypes
+        for c in current_schema:
+            logging.debug(
+                f"Added column '{table_change.column_name.upper()}' "
+                f"exists in the current schema: {current_schema}")
+            if c['COLUMN_NAME'].upper() == table_change.column_name.upper():
+                # convert name to upper_case just in case
+                # TODO: consider moving this to current_schema build-up
+                c['COLUMN_NAME'] = c['COLUMN_NAME'].upper()
+                existing_col = c
+
+        if existing_col:
+            new_column = existing_col
+        else:
+            # add metadata from the ALTER event
+            is_pkey = table_change.column_key == 'PRI'
+
+            charset_name = table_change.charset_name or self._get_db_default_schema()
+            new_column = self.build_column_schema(column_name=table_change.column_name.upper(),
+                                                  # to be updated later
+                                                  ordinal_position=0,
+                                                  column_type=table_change.data_type,
+                                                  is_primary_key=is_pkey,
+                                                  collation=table_change.collation,
+                                                  character_set_name=charset_name
+                                                  )
+
+        return new_column
+
+
+class ReportSlave(object):
     """Represent the values that you may report when connecting as a slave
     to a master. SHOW SLAVE HOSTS related"""
 
@@ -67,7 +365,7 @@ class ReportSlave(object):
             self.hostname = value
 
     def __repr__(self):
-        return '<ReportSlave hostname=%s username=%s password=%s port=%d>' %\
+        return '<ReportSlave hostname=%s username=%s password=%s port=%d>' % \
             (self.hostname, self.username, self.password, self.port)
 
     def encoded(self, server_id, master_id=0):
@@ -122,7 +420,6 @@ class ReportSlave(object):
 
 
 class BinLogStreamReader(object):
-
     """Connect to replication stream and read event
     """
     report_slave = None
@@ -141,7 +438,8 @@ class BinLogStreamReader(object):
                  fail_on_table_metadata_unavailable=False,
                  slave_heartbeat=None,
                  is_mariadb=False,
-                 ignore_decode_errors=False):
+                 ignore_decode_errors=False,
+                 table_schema_cache: dict = None):
         """
         Attributes:
             ctl_connection_settings: Connection settings for cluster holding
@@ -180,6 +478,7 @@ class BinLogStreamReader(object):
                     to point to Mariadb specific GTID.
             ignore_decode_errors: If true, any decode errors encountered 
                                   when reading column data will be ignored.
+            table_schema_cache: Latest schemas of the synced tables (from previous execution). Indexed by table name.
         """
 
         self.__connection_settings = connection_settings
@@ -206,7 +505,7 @@ class BinLogStreamReader(object):
         # We can't filter on packet level TABLE_MAP and rotate event because
         # we need them for handling other operations
         self.__allowed_events_in_packet = frozenset(
-            [TableMapEvent, RotateEvent]).union(self.__allowed_events)
+            [TableMapEvent, RotateEvent, QueryEventWithSchemaChanges]).union(self.__allowed_events)
 
         self.__server_id = server_id
         self.__use_checksum = False
@@ -233,6 +532,14 @@ class BinLogStreamReader(object):
         else:
             self.pymysql_wrapper = pymysql.connect
         self.mysql_version = (0, 0, 0)
+
+        # Store table meta information cached from the last time
+        self.schema_cache = TableColumnSchemaCache(table_schema_cache)
+
+        self.alter_parser = AlterStatementParser()
+
+        # init just in case of redeploying new version
+        # self._init_column_schema_cache(only_schemas[0], only_tables)
 
     def close(self):
         if self.__connected_stream:
@@ -310,7 +617,7 @@ class BinLogStreamReader(object):
                                                                4294967))
             # If heartbeat is too low, the connection will disconnect before,
             # this is also the behavior in mysql
-            heartbeat = float(min(net_timeout/2., self.slave_heartbeat))
+            heartbeat = float(min(net_timeout / 2., self.slave_heartbeat))
             if heartbeat > 4294967:
                 heartbeat = 4294967
 
@@ -343,7 +650,7 @@ class BinLogStreamReader(object):
                 cur.close()
 
             prelude = struct.pack('<i', len(self.log_file) + 11) \
-                + bytes(bytearray([COM_BINLOG_DUMP]))
+                      + bytes(bytearray([COM_BINLOG_DUMP]))
 
             if self.__resume_stream:
                 prelude += struct.pack('<I', self.log_pos)
@@ -371,7 +678,7 @@ class BinLogStreamReader(object):
                         4 +  # binlog pos
                         2 +  # binlog flags
                         4 +  # slave server_id,
-                        4    # requested binlog file name , set it to empty
+                        4  # requested binlog file name , set it to empty
                 )
 
                 prelude = struct.pack('<i', header_size) + bytes(bytearray([COM_BINLOG_DUMP]))
@@ -382,7 +689,7 @@ class BinLogStreamReader(object):
                 flags = 0
                 if not self.__blocking:
                     flags |= 0x01  # BINLOG_DUMP_NON_BLOCK
-                
+
                 # binlog flags
                 prelude += struct.pack('<H', flags)
 
@@ -391,7 +698,7 @@ class BinLogStreamReader(object):
 
                 # empty_binlog_name (4 bytes)
                 prelude += b'\0\0\0\0'
-                
+
             else:
                 # Format for mysql packet master_auto_position
                 #
@@ -438,8 +745,8 @@ class BinLogStreamReader(object):
                                8 +  # binlog_pos_info_size
                                4)  # encoded_data_size
 
-                prelude = b'' + struct.pack('<i', header_size + encoded_data_size)\
-                    + bytes(bytearray([COM_BINLOG_DUMP_GTID]))
+                prelude = b'' + struct.pack('<i', header_size + encoded_data_size) \
+                          + bytes(bytearray([COM_BINLOG_DUMP_GTID]))
 
                 flags = 0
                 if not self.__blocking:
@@ -566,16 +873,25 @@ class BinLogStreamReader(object):
 
             if binlog_event.event_type == TABLE_MAP_EVENT and \
                     binlog_event.event is not None:
-                self.table_map[binlog_event.event.table_id] = \
-                    binlog_event.event.get_table()
+                table_obj = binlog_event.event.get_table()
+                self.table_map[binlog_event.event.table_id] = table_obj
+
+                # store current schema
+                self._update_current_schema(table_obj.schema, table_obj.table)
+
+                # store internal table ids for convenience
+                self.schema_cache.update_table_ids_cache(table_obj.schema, table_obj.table,
+                                                         table_obj.table_id)
+
+            # Process ALTER events and update schema cache so the mapping works properly
+            if binlog_event.event_type == QUERY_EVENT and 'ALTER' in binlog_event.event.query.upper():
+                table_changes = self._update_cache_and_map(binlog_event.event)
+                binlog_event.event.schema_changes = table_changes
 
             # event is none if we have filter it on packet level
             # we filter also not allowed events
             if binlog_event.event is None or (binlog_event.event.__class__ not in self.__allowed_events):
                 continue
-
-            if binlog_event.event_type == FORMAT_DESCRIPTION_EVENT:
-                self.mysql_version = binlog_event.event.mysql_version
 
             return binlog_event.event
 
@@ -601,7 +917,7 @@ class BinLogStreamReader(object):
                 HeartbeatLogEvent,
                 NotImplementedEvent,
                 MariadbGtidEvent
-                ))
+            ))
         if ignored_events is not None:
             for e in ignored_events:
                 events.remove(e)
@@ -613,6 +929,19 @@ class BinLogStreamReader(object):
         return frozenset(events)
 
     def __get_table_information(self, schema, table):
+        if self.schema_cache.get_column_schema(schema, table):
+            return self._get_column_schema_from_cache(schema, table)
+        else:
+            # hacky way to call the parent secret method
+            current_column_schema = self._get_table_information_from_db(schema, table)
+            # update cache with current schema
+            self.schema_cache.set_column_schema(schema, table, current_column_schema)
+
+            # TODO: consider moving this to the binlog init so it's in sync and done only once
+            self.schema_cache.update_current_schema_cache(schema, table, current_column_schema)
+            return current_column_schema
+
+    def _get_table_information_from_db(self, schema: str, table: str):
         for i in range(1, 3):
             try:
                 if not self.__connected_ctl:
@@ -639,6 +968,143 @@ class BinLogStreamReader(object):
                     continue
                 else:
                     raise error
+
+    def _update_current_schema(self, schema, table):
+        """
+        Keeps current schema (at the point of execution) for later reference
+        """
+        if not self.schema_cache.is_current_schema_cached(schema, table):
+            column_schema = self._get_table_information_from_db(schema, table)
+            self.schema_cache.update_current_schema_cache(schema, table, column_schema)
+
+    def _update_cache_and_map(self, binlog_event: QueryEvent):
+        """
+        Updates schema cache based on given ALTER events. Refreshes the table_map
+        """
+        table_changes = self.alter_parser.get_table_changes(binlog_event.query, binlog_event.schema.decode())
+        monitored_changes = []
+        for table_change in table_changes:
+            # normalize table_name. We expect table names in lower case here.
+            table_change.table_name = table_change.table_name.lower()
+            table_change.schema = table_change.schema.lower()
+            # only monitored tables
+            logging.debug(
+                f'Table change detected: {table_change}, monitored tables: {self._BinLogStreamReader__only_tables}, '
+                f'monitored schemas: {self._BinLogStreamReader__only_schemas}')
+            if table_change.table_name not in self._BinLogStreamReader__only_tables:
+                continue
+            # only monitored schemas
+            if table_change.schema not in self._BinLogStreamReader__only_schemas:
+                continue
+            monitored_changes.append(table_change)
+            self.schema_cache.update_cache(table_change)
+
+            # invalidate table_map cache so it is rebuilt from schema cache next TABLE_MAP_EVENT
+            self._invalidate_table_map(table_change.schema, table_change.table_name)
+        if not monitored_changes:
+            logging.debug(f"ALTER statements detected, but no table change recognised. {binlog_event.query}")
+        return monitored_changes
+
+    def _invalidate_table_map(self, schema: str, table_name: str):
+        indexes = self.schema_cache.get_table_ids(schema, table_name)
+        for i in indexes:
+            self.table_map.pop(i, None)
+
+    def _init_column_schema_cache(self, schema: str, tables: List[str]):
+        """
+        Helper method to initi schema cache in case the extraction started with empty state
+        Returns:
+
+        """
+        for table in tables:
+            if self.schema_cache.get_column_schema(schema, table):
+                continue
+            logging.warning(f"Schema for table {schema}-{table} is not initialized, using current schema")
+            current_column_schema = self._get_table_information_from_db(schema, table)
+            # update cache with current schema
+            self.schema_cache.set_column_schema(schema, table, current_column_schema)
+
+            self.schema_cache.update_current_schema_cache(schema, table, current_column_schema)
+
+    def _BinLogStreamReader__get_table_information(self, schema, table):
+        """ Uglily overridden BinLogStreamReader private method via the "name mangling" black magic.
+            Get table information from Cache or fetch the current state.
+
+            This is being used in the TableMapEvent to get the schema if not present in the cache.
+            It allows to retrieve schema from the cache if present.
+
+        """
+        if self.schema_cache.get_column_schema(schema, table):
+            return self._get_column_schema_from_cache(schema, table)
+        else:
+            # hacky way to call the parent secret method
+            current_column_schema = self._get_table_information_from_db(schema, table)
+            # update cache with current schema
+            self.schema_cache.set_column_schema(schema, table, current_column_schema)
+
+            # TODO: consider moving this to the binlog init so it's in sync and done only once
+            self.schema_cache.update_current_schema_cache(schema, table, current_column_schema)
+            return current_column_schema
+
+    def _table_info_backoff(func):
+        @functools.wraps(func)
+        @backoff.on_exception(backoff.expo,
+                              pymysql.OperationalError,
+                              max_tries=3)
+        def wrapper(self, *args, **kwargs):
+            if not self._BinLogStreamReader__connected_ctl:
+                logging.warning('Mysql unreachable, trying to reconnect')
+                self._BinLogStreamReader__connect_to_ctl()
+            return func(self, *args, **kwargs)
+
+        return wrapper
+
+    @_table_info_backoff
+    def _get_table_information_from_db(self, schema, table):
+        for i in range(1, 3):
+            try:
+                if not self.__connected_ctl:
+                    self.__connect_to_ctl()
+
+                cur = self._ctl_connection.cursor()
+                query = cur.mogrify("""SELECT
+                        COLUMN_NAME, COLLATION_NAME, CHARACTER_SET_NAME,
+                        COLUMN_COMMENT, COLUMN_TYPE, COLUMN_KEY, ORDINAL_POSITION, DATA_TYPE,
+                        defaults.DEFAULT_COLLATION_NAME,
+                        defaults.DEFAULT_CHARSET
+                    FROM
+                        information_schema.columns col
+                    JOIN (SELECT
+                              default_character_set_name AS DEFAULT_CHARSET
+                            , DEFAULT_COLLATION_NAME     AS DEFAULT_COLLATION_NAME
+                        FROM information_schema.SCHEMATA
+                        WHERE
+                            SCHEMA_NAME = %s) as defaults ON 1=1
+                    WHERE
+                        table_schema = %s AND table_name = %s
+                    ORDER BY ORDINAL_POSITION;
+                    """, (schema, schema, table))
+                logging.debug(query)
+                cur.execute(query)
+                return cur.fetchall()
+            except pymysql.OperationalError as error:
+                code, message = error.args
+                if code in MYSQL_EXPECTED_ERROR_CODES:
+                    self._BinLogStreamReader__connected_ctl = False
+                    raise pymysql.OperationalError("Getting the initial schema failed, server unreachable!") from error
+                else:
+                    raise error
+
+    def _get_column_schema_from_cache(self, schema: str, table: str):
+        column_schema = self.schema_cache.get_column_schema(schema, table)
+        # convert to upper case
+        for c in column_schema:
+            c['COLUMN_NAME'] = c['COLUMN_NAME'].upper()
+            # backward compatibility after update to mysql-replication==0.43.0
+            if not c.get('DATA_TYPE'):
+                c['DATA_TYPE'] = c['COLUMN_TYPE']
+
+        return column_schema
 
     def __iter__(self):
         return iter(self.fetchone, None)

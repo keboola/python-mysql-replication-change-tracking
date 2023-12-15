@@ -1,6 +1,6 @@
 class TableMetadataUnavailableError(Exception):
     def __init__(self, table):
-        Exception.__init__(self,"Unable to find metadata for table {0}".format(table))
+        Exception.__init__(self, "Unable to find metadata for table {0}".format(table))
 
 
 class BinLogNotEnabled(Exception):
@@ -17,3 +17,7 @@ class StatusVariableMismatch(Exception):
             , "Refer to MySQL documentation/source code"
             , "or create an issue on GitHub"
         ))
+
+
+class SchemaOffsyncError(Exception):
+    pass

@@ -6,8 +6,8 @@ try:
 except ImportError:
     from distutils.core import setup, Command
 
-from pathlib import Path
 import sys
+from pathlib import Path
 
 
 class TestCommand(Command):
@@ -49,5 +49,5 @@ setup(
               "pymysqlreplication.constants",
               "pymysqlreplication.tests"],
     cmdclass={"test": TestCommand},
-    install_requires=['pymysql>=1.1.0'],
+    install_requires=['pymysql>=1.1.0', 'backoff', 'sqlparse'],
 )

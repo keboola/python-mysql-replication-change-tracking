@@ -15,7 +15,6 @@ UNSIGNED_SHORT_LENGTH = 2
 UNSIGNED_INT24_LENGTH = 3
 UNSIGNED_INT64_LENGTH = 8
 
-
 JSONB_TYPE_SMALL_OBJECT = 0x0
 JSONB_TYPE_LARGE_OBJECT = 0x1
 JSONB_TYPE_SMALL_ARRAY = 0x2
@@ -59,7 +58,7 @@ class BinLogPacketWrapper(object):
 
     __event_map = {
         # event
-        constants.QUERY_EVENT: event.QueryEvent,
+        constants.QUERY_EVENT: event.QueryEventWithSchemaChanges,
         constants.ROTATE_EVENT: event.RotateEvent,
         constants.FORMAT_DESCRIPTION_EVENT: event.FormatDescriptionEvent,
         constants.XID_EVENT: event.XidEvent,
@@ -79,7 +78,7 @@ class BinLogPacketWrapper(object):
         constants.DELETE_ROWS_EVENT_V2: row_event.DeleteRowsEvent,
         constants.TABLE_MAP_EVENT: row_event.TableMapEvent,
 
-        #5.6 GTID enabled replication events
+        # 5.6 GTID enabled replication events
         constants.ANONYMOUS_GTID_LOG_EVENT: event.NotImplementedEvent,
         constants.PREVIOUS_GTIDS_LOG_EVENT: event.NotImplementedEvent,
         # MariaDB GTID
@@ -432,13 +431,13 @@ class BinLogPacketWrapper(object):
         if large:
             key_offset_lengths = [(
                 self.read_uint32(),  # offset (we don't actually need that)
-                self.read_uint16()   # size of the key
-                ) for _ in range(elements)]
+                self.read_uint16()  # size of the key
+            ) for _ in range(elements)]
         else:
             key_offset_lengths = [(
                 self.read_uint16(),  # offset (we don't actually need that)
-                self.read_uint16()   # size of key
-                ) for _ in range(elements)]
+                self.read_uint16()  # size of key
+            ) for _ in range(elements)]
 
         value_type_inlined_lengths = [read_offset_or_inline(self, large)
                                       for _ in range(elements)]
