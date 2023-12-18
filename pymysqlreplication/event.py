@@ -20,7 +20,8 @@ class BinLogEvent(object):
                  ignored_schemas=None,
                  freeze_schema=False,
                  fail_on_table_metadata_unavailable=False,
-                 ignore_decode_errors=False):
+                 ignore_decode_errors=False,
+                 convert_to_upper_case=False):
         self.packet = from_packet
         self.table_map = table_map
         self.event_type = self.packet.event_type
@@ -34,6 +35,7 @@ class BinLogEvent(object):
         # the event will be skipped
         self._processed = True
         self.complete = True
+        self._convert_to_upper_case = convert_to_upper_case
 
     def _read_table_id(self):
         # Table ID is 6 byte
@@ -264,6 +266,20 @@ class QueryEvent(BinLogEvent):
         self.query = self.packet.read(event_size - 13 - self.status_vars_length
                                       - self.schema_length - 1).decode("utf-8")
         # string[EOF]    query
+        self._schema_changes = []
+
+    class QueryType(Enum):
+        QUERY = 'query'
+        ALTER_QUERY = 'alter_query'
+
+    @property
+    def schema_changes(self) -> List[TableSchemaChange]:
+        return self._schema_changes
+
+    @schema_changes.setter
+    def schema_changes(self, schema_changes: List[TableSchemaChange]):
+        self.event_type = QueryEvent.QueryType.ALTER_QUERY
+        self._schema_changes = schema_changes
 
     def _dump(self):
         super(QueryEvent, self)._dump()
@@ -454,33 +470,3 @@ class NotImplementedEvent(BinLogEvent):
         super(NotImplementedEvent, self).__init__(
             from_packet, event_size, table_map, ctl_connection, **kwargs)
         self.packet.advance(event_size)
-
-
-class QueryEventWithSchemaChanges(QueryEvent):
-    """
-    Query event wrapper that contains list of Alter Table Changes.
-
-
-    """
-
-    class QueryType(Enum):
-        QUERY = 'query'
-        ALTER_QUERY = 'alter_query'
-
-    def __init__(self, from_packet, event_size, table_map,
-                 ctl_connection, **kwargs):
-        super().__init__(from_packet, event_size, table_map,
-                         ctl_connection, **kwargs)
-
-        self._schema_changes = []
-        # default event type
-        self.event_type = QueryEventWithSchemaChanges.QueryType.QUERY
-
-    @property
-    def schema_changes(self) -> List[TableSchemaChange]:
-        return self._schema_changes
-
-    @schema_changes.setter
-    def schema_changes(self, schema_changes: List[TableSchemaChange]):
-        self.event_type = QueryEventWithSchemaChanges.QueryType.ALTER_QUERY
-        self._schema_changes = schema_changes

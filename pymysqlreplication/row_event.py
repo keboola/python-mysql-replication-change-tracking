@@ -635,7 +635,8 @@ class TableMapEvent(BinLogEvent):
                     column_schema = self.column_schemas[ordinal_pos_loc]
 
                     # normalize header
-                    column_schema['COLUMN_NAME'] = column_schema['COLUMN_NAME'].upper()
+                    if self._convert_to_upper_case:
+                        column_schema['COLUMN_NAME'] = column_schema['COLUMN_NAME'].upper()
 
                     # only acknowledge the column definition if the iteration matches with ordinal position of
                     # the column. this helps in maintaining support for restricted columnar access
@@ -659,6 +660,10 @@ class TableMapEvent(BinLogEvent):
 
         self.table_obj = Table(self.column_schemas, self.table_id, self.schema,
                                self.table, self.columns)
+
+        # ith column is nullable if (i - 1)th bit is set to True, not nullable otherwise
+        ## Refer to definition of and call to row.event._is_null() to interpret bitmap corresponding to columns
+        self.null_bitmask = self.packet.read((self.column_count + 7) / 8)
 
     def get_table(self):
         return self.table_obj

@@ -16,7 +16,7 @@ from .event import (
     QueryEvent, RotateEvent, FormatDescriptionEvent,
     XidEvent, GtidEvent, StopEvent, XAPrepareEvent,
     BeginLoadQueryEvent, ExecuteLoadQueryEvent,
-    HeartbeatLogEvent, NotImplementedEvent, MariadbGtidEvent, QueryEventWithSchemaChanges)
+    HeartbeatLogEvent, NotImplementedEvent, MariadbGtidEvent)
 from .exceptions import BinLogNotEnabled, SchemaOffsyncError
 from .gtid import GtidSet
 from .packet import BinLogPacketWrapper
@@ -56,7 +56,8 @@ class TableColumnSchemaCache:
     """
 
     def __init__(self, table_schema_cache: dict, table_schema_current: dict = None,
-                 cache_index_callable: Callable = lambda a, b: a + '-' + b):
+                 cache_index_callable: Callable = lambda a, b: a + '-' + b,
+                 convert_columns_to_upper_case: bool = False):
         """
 
         Args:
@@ -72,6 +73,7 @@ class TableColumnSchemaCache:
         #         (possibly newer than table_schema_cache)
         self._table_schema_current = table_schema_current or {}
         self._cache_index_generator = cache_index_callable
+        self._convert_columns_to_uppercase = convert_columns_to_upper_case
 
     def _get_db_default_schema(self):
         table_schema = {}
@@ -302,13 +304,21 @@ class TableColumnSchemaCache:
         # this allows to get all column metadata properly in case
         # we missed some ALTER COLUMN statement, e.g. for changing datatypes
         for c in current_schema:
+
+            current_colname = c['COLUMN_NAME']
+            change_colname = table_change.column_name
+            if self._convert_columns_to_uppercase:
+                current_colname = current_colname.upper()
+                change_colname = change_colname.upper()
             logging.debug(
-                f"Added column '{table_change.column_name.upper()}' "
+                f"Added column '{change_colname}' "
                 f"exists in the current schema: {current_schema}")
-            if c['COLUMN_NAME'].upper() == table_change.column_name.upper():
-                # convert name to upper_case just in case
-                # TODO: consider moving this to current_schema build-up
-                c['COLUMN_NAME'] = c['COLUMN_NAME'].upper()
+
+            if current_colname == change_colname:
+                if self._convert_columns_to_uppercase:
+                    # convert name to upper_case just in case
+                    # TODO: consider moving this to current_schema build-up
+                    c['COLUMN_NAME'] = c['COLUMN_NAME'].upper()
                 existing_col = c
 
         if existing_col:
@@ -439,7 +449,8 @@ class BinLogStreamReader(object):
                  slave_heartbeat=None,
                  is_mariadb=False,
                  ignore_decode_errors=False,
-                 table_schema_cache: dict = None):
+                 table_schema_cache: dict = None,
+                 convert_columns_to_upper_case: bool = False):
         """
         Attributes:
             ctl_connection_settings: Connection settings for cluster holding
@@ -479,6 +490,7 @@ class BinLogStreamReader(object):
             ignore_decode_errors: If true, any decode errors encountered 
                                   when reading column data will be ignored.
             table_schema_cache: Latest schemas of the synced tables (from previous execution). Indexed by table name.
+            convert_columns_to_upper_case: Converts columns to uppercase
         """
 
         self.__connection_settings = connection_settings
@@ -505,7 +517,7 @@ class BinLogStreamReader(object):
         # We can't filter on packet level TABLE_MAP and rotate event because
         # we need them for handling other operations
         self.__allowed_events_in_packet = frozenset(
-            [TableMapEvent, RotateEvent, QueryEventWithSchemaChanges]).union(self.__allowed_events)
+            [TableMapEvent, RotateEvent, QueryEvent]).union(self.__allowed_events)
 
         self.__server_id = server_id
         self.__use_checksum = False
@@ -534,12 +546,14 @@ class BinLogStreamReader(object):
         self.mysql_version = (0, 0, 0)
 
         # Store table meta information cached from the last time
-        self.schema_cache = TableColumnSchemaCache(table_schema_cache)
+        self.schema_cache = TableColumnSchemaCache(table_schema_cache, convert_columns_to_upper_case)
 
         self.alter_parser = AlterStatementParser()
 
         # init just in case of redeploying new version
         # self._init_column_schema_cache(only_schemas[0], only_tables)
+
+        self.__convert_columns_to_uppercase = convert_columns_to_upper_case
 
     def close(self):
         if self.__connected_stream:
@@ -822,7 +836,8 @@ class BinLogStreamReader(object):
                                                self.__ignored_schemas,
                                                self.__freeze_schema,
                                                self.__fail_on_table_metadata_unavailable,
-                                               self.__ignore_decode_errors)
+                                               self.__ignore_decode_errors,
+                                               convert_columns_to_upper_case=self.__convert_columns_to_uppercase)
 
             if binlog_event.event_type == ROTATE_EVENT:
                 self.log_pos = binlog_event.event.position
@@ -932,7 +947,6 @@ class BinLogStreamReader(object):
         if self.schema_cache.get_column_schema(schema, table):
             return self._get_column_schema_from_cache(schema, table)
         else:
-            # hacky way to call the parent secret method
             current_column_schema = self._get_table_information_from_db(schema, table)
             # update cache with current schema
             self.schema_cache.set_column_schema(schema, table, current_column_schema)
@@ -941,6 +955,20 @@ class BinLogStreamReader(object):
             self.schema_cache.update_current_schema_cache(schema, table, current_column_schema)
             return current_column_schema
 
+    def _table_info_backoff(func):
+        @functools.wraps(func)
+        @backoff.on_exception(backoff.expo,
+                              pymysql.OperationalError,
+                              max_tries=3)
+        def wrapper(self, *args, **kwargs):
+            if not self._BinLogStreamReader__connected_ctl:
+                logging.warning('Mysql unreachable, trying to reconnect')
+                self._BinLogStreamReader__connect_to_ctl()
+            return func(self, *args, **kwargs)
+
+        return wrapper
+
+    @_table_info_backoff
     def _get_table_information_from_db(self, schema: str, table: str):
         for i in range(1, 3):
             try:
@@ -948,24 +976,31 @@ class BinLogStreamReader(object):
                     self.__connect_to_ctl()
 
                 cur = self._ctl_connection.cursor()
-                cur.execute("""
-                    SELECT
+                query = cur.mogrify("""SELECT
                         COLUMN_NAME, COLLATION_NAME, CHARACTER_SET_NAME,
-                        COLUMN_COMMENT, COLUMN_TYPE, COLUMN_KEY, ORDINAL_POSITION,
-                        DATA_TYPE, CHARACTER_OCTET_LENGTH
+                        COLUMN_COMMENT, COLUMN_TYPE, COLUMN_KEY, ORDINAL_POSITION, DATA_TYPE, CHARACTER_OCTET_LENGTH,
+                        defaults.DEFAULT_COLLATION_NAME,
+                        defaults.DEFAULT_CHARSET
                     FROM
-                        information_schema.columns
+                        information_schema.columns col
+                    JOIN (SELECT
+                              default_character_set_name AS DEFAULT_CHARSET
+                            , DEFAULT_COLLATION_NAME     AS DEFAULT_COLLATION_NAME
+                        FROM information_schema.SCHEMATA
+                        WHERE
+                            SCHEMA_NAME = %s) as defaults ON 1=1
                     WHERE
                         table_schema = %s AND table_name = %s
-                    ORDER BY ORDINAL_POSITION
-                    """, (schema, table))
-
+                    ORDER BY ORDINAL_POSITION;
+                    """, (schema, schema, table))
+                logging.debug(query)
+                cur.execute(query)
                 return cur.fetchall()
             except pymysql.OperationalError as error:
                 code, message = error.args
                 if code in MYSQL_EXPECTED_ERROR_CODES:
-                    self.__connected_ctl = False
-                    continue
+                    self._BinLogStreamReader__connected_ctl = False
+                    raise pymysql.OperationalError("Getting the initial schema failed, server unreachable!") from error
                 else:
                     raise error
 
@@ -989,12 +1024,12 @@ class BinLogStreamReader(object):
             table_change.schema = table_change.schema.lower()
             # only monitored tables
             logging.debug(
-                f'Table change detected: {table_change}, monitored tables: {self._BinLogStreamReader__only_tables}, '
-                f'monitored schemas: {self._BinLogStreamReader__only_schemas}')
-            if table_change.table_name not in self._BinLogStreamReader__only_tables:
+                f'Table change detected: {table_change}, monitored tables: {self.__only_tables}, '
+                f'monitored schemas: {self.__only_schemas}')
+            if self.__only_tables and table_change.table_name not in self.__only_tables:
                 continue
             # only monitored schemas
-            if table_change.schema not in self._BinLogStreamReader__only_schemas:
+            if self.__only_schemas and table_change.schema not in self.__only_schemas:
                 continue
             monitored_changes.append(table_change)
             self.schema_cache.update_cache(table_change)
@@ -1046,60 +1081,15 @@ class BinLogStreamReader(object):
             self.schema_cache.update_current_schema_cache(schema, table, current_column_schema)
             return current_column_schema
 
-    def _table_info_backoff(func):
-        @functools.wraps(func)
-        @backoff.on_exception(backoff.expo,
-                              pymysql.OperationalError,
-                              max_tries=3)
-        def wrapper(self, *args, **kwargs):
-            if not self._BinLogStreamReader__connected_ctl:
-                logging.warning('Mysql unreachable, trying to reconnect')
-                self._BinLogStreamReader__connect_to_ctl()
-            return func(self, *args, **kwargs)
-
-        return wrapper
-
-    @_table_info_backoff
-    def _get_table_information_from_db(self, schema, table):
-        for i in range(1, 3):
-            try:
-                if not self.__connected_ctl:
-                    self.__connect_to_ctl()
-
-                cur = self._ctl_connection.cursor()
-                query = cur.mogrify("""SELECT
-                        COLUMN_NAME, COLLATION_NAME, CHARACTER_SET_NAME,
-                        COLUMN_COMMENT, COLUMN_TYPE, COLUMN_KEY, ORDINAL_POSITION, DATA_TYPE,
-                        defaults.DEFAULT_COLLATION_NAME,
-                        defaults.DEFAULT_CHARSET
-                    FROM
-                        information_schema.columns col
-                    JOIN (SELECT
-                              default_character_set_name AS DEFAULT_CHARSET
-                            , DEFAULT_COLLATION_NAME     AS DEFAULT_COLLATION_NAME
-                        FROM information_schema.SCHEMATA
-                        WHERE
-                            SCHEMA_NAME = %s) as defaults ON 1=1
-                    WHERE
-                        table_schema = %s AND table_name = %s
-                    ORDER BY ORDINAL_POSITION;
-                    """, (schema, schema, table))
-                logging.debug(query)
-                cur.execute(query)
-                return cur.fetchall()
-            except pymysql.OperationalError as error:
-                code, message = error.args
-                if code in MYSQL_EXPECTED_ERROR_CODES:
-                    self._BinLogStreamReader__connected_ctl = False
-                    raise pymysql.OperationalError("Getting the initial schema failed, server unreachable!") from error
-                else:
-                    raise error
-
     def _get_column_schema_from_cache(self, schema: str, table: str):
         column_schema = self.schema_cache.get_column_schema(schema, table)
-        # convert to upper case
+
         for c in column_schema:
-            c['COLUMN_NAME'] = c['COLUMN_NAME'].upper()
+
+            c['COLUMN_NAME'] = c['COLUMN_NAME']
+            if self.__convert_columns_to_uppercase:
+                c['COLUMN_NAME'] = c['COLUMN_NAME'].upper()
+
             # backward compatibility after update to mysql-replication==0.43.0
             if not c.get('DATA_TYPE'):
                 c['DATA_TYPE'] = c['COLUMN_TYPE']

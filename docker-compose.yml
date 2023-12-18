@@ -17,11 +17,11 @@ services:
     command: mysqld --log-bin=mysql-bin.log --server-id 1 --binlog-format=row --gtid_mode=on --enforce-gtid-consistency=on --log_slave_updates -P 3307
 
 
-  mysql:
-    image: mysql:5.7.12
-    command: mysqld --log-bin=mysql-bin.log --server-id 1 --binlog-format=row --gtid_mode=on --enforce-gtid-consistency=on --log_slave_updates
-    environment:
-      MYSQL_DATABASE: pymysqlreplication_test
-      MYSQL_ALLOW_EMPTY_PASSWORD: true
-    ports:
-      - "3306:3306"
+#  mysql:
+#    image: mysql:5.7.12
+#    command: mysqld --log-bin=mysql-bin.log --server-id 1 --binlog-format=row --gtid_mode=on --enforce-gtid-consistency=on --log_slave_updates
+#    environment:
+#      MYSQL_DATABASE: pymysqlreplication_test
+#      MYSQL_ALLOW_EMPTY_PASSWORD: true
+#    ports:
+#      - "3306:3306"
